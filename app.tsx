@@ -240,7 +240,7 @@ function SessionSummaryButton({ threadId, isCompactViewport }: PluginThreadHeade
         aria-label="Session summary"
         aria-pressed={open}
         title={open ? "Close session summary" : "Open session summary (stays open until you press this again)"}
-        className={`relative inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-all duration-150 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${PRIMARY_TINT_OPEN} data-[state=open]:shadow-[inset_0_0_0_1px_color-mix(in_oklab,var(--primary)_35%,transparent)]`}
+        className={`relative inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-all duration-150 hover:bg-[color-mix(in_oklab,var(--foreground)_10%,transparent)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${PRIMARY_TINT_OPEN} data-[state=open]:shadow-[inset_0_0_0_1px_color-mix(in_oklab,var(--primary)_35%,transparent)]`}
       >
         <Icon name="Layers" className="size-4" />
       </Popover.Trigger>
