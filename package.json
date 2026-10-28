@@ -1,0 +1,36 @@
+{
+  "name": "bb-plugin-session-summary",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.47",
+    "bbPluginSdk": ">=0.6.79"
+  },
+  "bb": {
+    "name": "Session Summary",
+    "description": "See a thread's machine, branch, context usage by source, MCP connectors, and the PRs and issues it opened, from a button in the thread header.",
+    "branding": {
+      "icon": "Layers"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "app": "./app.tsx"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.79",
+    "@radix-ui/react-popover": "^1.1.19",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "description": "A thread's environment, context by source, MCP connectors, and the PRs and issues it opened, in a thread header popover.",
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts",
+    "build": "bb plugin build"
+  }
+}
