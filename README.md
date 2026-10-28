@@ -4,6 +4,17 @@ A thread's environment, context usage by source, MCP connectors, and the PRs
 and issues it opened, in a popover from a button in the thread header and
 as `bb session-summary`.
 
+## Install
+
+Install it from GitHub (bb builds it during the install):
+
+```sh
+bb plugin install git:github.com/itsyaasir/bb-plugin-session-summary
+```
+
+Update with `bb plugin update session-summary`, and remove with
+`bb plugin remove session-summary`.
+
 ## Files
 
 - `contract.ts`: the `session_summary` and `work_item_statuses` RPC
