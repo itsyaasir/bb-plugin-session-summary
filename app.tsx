@@ -251,6 +251,9 @@ function SessionSummaryButton({ threadId, isCompactViewport }: PluginThreadHeade
           alignOffset={alignOffset}
           sideOffset={14}
           collisionPadding={12}
+          // It stays open while the side panel slides the header, which moves
+          // the button without resizing it; follow it every frame.
+          updatePositionStrategy="always"
           onOpenAutoFocus={(event) => {
             // Restoring an open popover must not steal focus from the composer.
             if (restoring.current) event.preventDefault();
