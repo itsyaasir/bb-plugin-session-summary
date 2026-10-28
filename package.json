@@ -2,6 +2,7 @@
   "name": "bb-plugin-session-summary",
   "version": "0.1.0",
   "type": "module",
+  "license": "MIT",
   "engines": {
     "bb": ">=0.47",
     "bbPluginSdk": ">=0.6.79"

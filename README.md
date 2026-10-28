@@ -65,3 +65,7 @@ npm test
 bb plugin build
 bb plugin install .
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
