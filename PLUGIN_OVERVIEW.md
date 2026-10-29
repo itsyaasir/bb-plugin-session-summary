@@ -8,6 +8,19 @@ header.
   project folder, and the working tree's changed files. Click the folder to
   open it in Finder or in a terminal, copy its path, or open its repository;
   click the branch to open a terminal or copy its name.
+- **Servers**: what is running from the thread's folder: dev servers, and
+  Docker Compose services like Postgres. Each one's ⋯ menu opens it in the
+  browser, copies its URL, or stops it. Name a port with a `.bb/ports.json`
+  in the folder: `{"ports": [{"port": 3000, "label": "Web"}]}`.
+- **Background**: commands, subagents, and workflows the agent started in
+  the background. Running ones come first with a live timer; finished ones
+  stay listed with their result, duration, tokens, and output file. Expand a
+  subagent and choose **View conversation** to read its prompt, tool calls,
+  and report in a side-panel tab; it follows along while the subagent runs.
+- **Lineage**: the chain of threads above this one up to the root, and every
+  thread below it as a tree: children, their children, and so on, each
+  branch folding away. A thread that worked in the same folder as an earlier
+  sibling (a review of that work) sits under it. bb's live status on each. Click one to open it.
 - **Context**: tokens used against the window with a stacked bar, the
   auto-compact point, and for Claude Code the breakdown by source. Expand a
   source to see what fills it: memory file paths, skills, agents, MCP tools.

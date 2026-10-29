@@ -8,17 +8,26 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
   formatTokens,
+  hasConversation,
+  isTaskActive,
+  lineageTree,
+  NO_DETAILS,
+  taskFacts,
   hostContract,
   rpcContract,
   summaryInputSchema,
   threadTag,
   workItemKey,
   type ItemStatuses,
+  type BackgroundTask,
   type SessionSummary,
+  type ThreadPort,
+  type ThreadRef,
+  type TranscriptDetails,
 } from "./contract.ts";
-import { repositoryWebUrl } from "./github.ts";
 import { WorkItemStatuses } from "./statuses.ts";
-import { buildSessionSummary, TimelineCache } from "./summary.ts";
+import { buildSessionSummary, readThreadPlace, TimelineCache } from "./summary.ts";
+import { subagentConversation } from "./transcript.ts";
 
 /** Event types that can change what the summary shows. Deltas are ignored. */
 const RELEVANT_EVENT_TYPES = new Set<string>([
@@ -28,8 +37,13 @@ const RELEVANT_EVENT_TYPES = new Set<string>([
   "thread/contextWindowUsage/updated",
   "thread/compacted",
   "thread/context/cleared",
+  "item/backgroundTask/progress",
+  "item/backgroundTask/completed",
 ]);
 const REFRESH_DEBOUNCE_MS = 1_000;
+const MAX_CACHED_DETAILS = 200;
+/** A transcript that has not named its model yet is read again after this long. */
+const DETAILS_RETRY_MS = 15_000;
 
 export default async function plugin(bb: BbPluginApi) {
   const timeline = new TimelineCache(bb.sdk);
@@ -40,27 +54,72 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** The machine and folder a thread runs in, when it has both. */
   const threadFolder = async (threadId: string) => {
-    const thread = await bb.sdk.threads.get({ threadId });
-    if (thread.environmentId === null) return null;
-    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-    return environment.hostId === null || environment.path === null
-      ? null
-      : { hostId: environment.hostId, path: environment.path, isGitRepo: environment.isGitRepo };
+    const { environment } = await readThreadPlace(bb.sdk, threadId);
+    return environment === null || environment.path === null ? null : { hostId: environment.hostId, path: environment.path };
+  };
+  const requireFolder = async (threadId: string) => {
+    const folder = await threadFolder(threadId);
+    if (folder === null) throw new Error("This thread has no folder on a machine.");
+    return folder;
+  };
+
+  /**
+   * What only the provider's file says. Best effort: the steps show without
+   * it. Kept once the model is known, since it never changes after that.
+   */
+  const details = new Map<string, { read: TranscriptDetails; at: number }>();
+  const readDetails = async (threadId: string, task: BackgroundTask, sessionId: string | null): Promise<TranscriptDetails> => {
+    const key = `${threadId}\u0000${task.id}`;
+    const known = details.get(key);
+    if (known !== undefined && (known.read.model !== null || Date.now() - known.at < DETAILS_RETRY_MS)) return known.read;
+    const { thread, environment } = await readThreadPlace(bb.sdk, threadId).catch(() => ({ thread: null, environment: null }));
+    if (thread === null || environment === null || environment.path === null) return NO_DETAILS;
+    // The path comes from the thread's own events, never from the caller.
+    const read = await host
+      .call(
+        "transcript_details",
+        {
+          providerId: thread.providerId,
+          path: task.outputFile,
+          agentId: task.agentId,
+          sessionId,
+          childRef: task.childRef,
+          folder: environment.path,
+        },
+        { hostId: environment.hostId, timeoutMs: 30_000 },
+      )
+      .catch(() => NO_DETAILS);
+    details.delete(key);
+    details.set(key, { read, at: Date.now() });
+    if (details.size > MAX_CACHED_DETAILS) details.delete(details.keys().next().value!);
+    return read;
+  };
+
+  const threadPorts = async (threadId: string) => {
+    const folder = await threadFolder(threadId);
+    return folder === null ? null : host.call("ports", { path: folder.path }, { hostId: folder.hostId });
   };
 
   bb.rpc.register(rpcContract, {
     session_summary: ({ threadId }) => buildSessionSummary(bb.sdk, timeline, threadId),
     work_item_statuses: ({ threadId }) => statuses.read(threadId),
-    repository: async ({ threadId }) => {
-      const folder = await threadFolder(threadId);
-      if (folder === null || !folder.isGitRepo) return { url: null };
-      const { remote } = await host.call("origin_url", { path: folder.path }, { hostId: folder.hostId });
-      return { url: remote === null ? null : repositoryWebUrl(remote) };
-    },
     reveal_folder: async ({ threadId }) => {
-      const folder = await threadFolder(threadId);
-      if (folder === null) throw new Error("This thread has no folder.");
+      const folder = await requireFolder(threadId);
       return host.call("reveal", { path: folder.path }, { hostId: folder.hostId });
+    },
+    thread_ports: ({ threadId }) => threadPorts(threadId),
+    stop_port: async ({ threadId, port }) => {
+      const folder = await requireFolder(threadId);
+      return host.call("stop_port", { path: folder.path, port }, { hostId: folder.hostId, timeoutMs: 40_000 });
+    },
+    subagent_transcript: async ({ threadId, taskId }) => {
+      const scan = await timeline.read(threadId);
+      const task = scan.background.tasks.get(taskId);
+      if (task === undefined) throw new Error("This thread has no such background task.");
+      if (!hasConversation(task)) throw new Error("This task has no conversation to show.");
+      const { model, effort, prompt } = await readDetails(threadId, task, scan.sessionId);
+      const conversation = subagentConversation(scan.steps.get(task.delegationId!), prompt, !isTaskActive(task.state));
+      return { model, effort, ...conversation };
     },
   });
 
@@ -92,6 +151,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (
             event.changes.includes("environment-changed") ||
             event.changes.includes("history-compacted") ||
+            event.metadata?.backgroundActivityChanged === true ||
             eventTypes.some((type) => RELEVANT_EVENT_TYPES.has(type))
           ) {
             refresh();
@@ -99,21 +159,6 @@ export default async function plugin(bb: BbPluginApi) {
         },
       }),
     );
-    // Git status (branch switch, new commits, edited files) lives on the environment.
-    bb.sdk.threads.get({ threadId }).then(
-      (thread) => {
-        if (signal.aborted || thread.environmentId === null) return;
-        unsubscribers.push(
-          bb.sdk.subscribe({
-            event: "environment:changed",
-            environmentId: thread.environmentId,
-            callback: refresh,
-          }),
-        );
-      },
-      (error: unknown) => bb.log.warn(`could not watch ${threadId}'s environment: ${String(error)}`),
-    );
-
     signal.addEventListener(
       "abort",
       () => {
@@ -127,7 +172,7 @@ export default async function plugin(bb: BbPluginApi) {
   const usage = "Usage: bb session-summary [thread-id] [--json]";
   bb.cli.register({
     name: "session-summary",
-    summary: "Summarize a thread's environment, context, connectors, and changes (bb session-summary [thread-id] [--json])",
+    summary: "Summarize a thread's environment, context, connectors, background tasks, lineage, and changes (bb session-summary [thread-id] [--json])",
     async run(argv, ctx) {
       const json = argv.includes("--json");
       const args = argv.filter((arg) => arg !== "--json");
@@ -139,19 +184,22 @@ export default async function plugin(bb: BbPluginApi) {
       if (threadId === undefined) {
         return { exitCode: 1, stderr: `No thread. Pass a thread id or run inside a thread.\n${usage}` };
       }
-      const [summary, itemStatuses] = await Promise.all([
+      const [summary, itemStatuses, ports] = await Promise.all([
         buildSessionSummary(bb.sdk, timeline, threadId),
         statuses.read(threadId).catch((): ItemStatuses => ({})),
+        threadPorts(threadId).then((result) => result?.ports ?? [], (): ThreadPort[] => []),
       ]);
       return {
         exitCode: 0,
-        stdout: json ? JSON.stringify({ ...summary, statuses: itemStatuses }) : formatSummary(summary, itemStatuses),
+        stdout: json
+          ? JSON.stringify({ ...summary, statuses: itemStatuses, ports })
+          : formatSummary(summary, itemStatuses, ports),
       };
     },
   });
 }
 
-function formatSummary(summary: SessionSummary, statuses: ItemStatuses): string {
+function formatSummary(summary: SessionSummary, statuses: ItemStatuses, ports: ThreadPort[]): string {
   const lines: string[] = [`Thread ${summary.threadId} (${summary.providerId})`, ""];
   const env = summary.environment;
   lines.push("Environment");
@@ -169,6 +217,19 @@ function formatSummary(summary: SessionSummary, statuses: ItemStatuses): string 
       const tree = env.workingTree;
       lines.push(`  Working tree: ${tree.fileCount} files, +${tree.insertions} -${tree.deletions}`);
     }
+    if (env.branchChanges !== null) {
+      const branch = env.branchChanges;
+      lines.push(
+        `  Branch vs ${branch.base}: ${branch.commits} commits, ${branch.fileCount} files, +${branch.insertions} -${branch.deletions}`,
+      );
+    }
+  }
+
+  lines.push("", "Servers");
+  if (ports.length === 0) lines.push("  None running from this folder");
+  for (const port of ports) {
+    const role = port.role === "app" ? "" : ` (${port.role})`;
+    lines.push(`  ${port.url}  ${port.name}${role}`);
   }
 
   lines.push("", "Context");
@@ -196,6 +257,30 @@ function formatSummary(summary: SessionSummary, statuses: ItemStatuses): string 
     lines.push(`  ${connector.server}: ${tools}${connector.calls} calls`);
   }
 
+  lines.push("", "Lineage");
+  const { fork, ancestors, descendants, truncated } = summary.lineage;
+  if (ancestors.length === 0 && descendants.length === 0) lines.push("  No parent or children");
+  ancestors.forEach((thread, depth) => {
+    const direct = depth === ancestors.length - 1;
+    const label = direct ? (fork ? "Forked from" : "Parent") : "Ancestor";
+    lines.push(`  ${"  ".repeat(depth)}${label}: ${formatThreadRef(thread)}`);
+  });
+  const tree = lineageTree(descendants, summary.threadId, summary.environment?.id ?? null);
+  const below = (parentId: string, depth: number): void => {
+    for (const child of tree.get(parentId) ?? []) {
+      const label = child.parentId !== parentId ? "Same folder" : child.fork ? "Fork" : "Child";
+      lines.push(`  ${"  ".repeat(depth)}${label}: ${formatThreadRef(child)}`);
+      below(child.id, depth + 1);
+    }
+  };
+  below(summary.threadId, 0);
+  if (truncated) lines.push("  …and more below");
+
+  lines.push("", "Background");
+  if (summary.background.length === 0) lines.push("  None");
+  for (const task of summary.background) lines.push(`  ${formatBackgroundTask(task)}`);
+  if (summary.moreBackground > 0) lines.push(`  …and ${summary.moreBackground} older`);
+
   lines.push("", "Changes");
   const pr = summary.changes.pullRequest;
   if (pr !== null) {
@@ -216,4 +301,17 @@ function formatSummary(summary: SessionSummary, statuses: ItemStatuses): string 
   }
   if (pr === null && summary.changes.workItems.length === 0) lines.push("  None");
   return lines.join("\n");
+}
+
+function formatThreadRef(thread: ThreadRef): string {
+  const archived = thread.archived ? ", archived" : "";
+  return `${thread.title} (${thread.id}, ${thread.providerId}, ${thread.status}${archived})`;
+}
+
+function formatBackgroundTask(task: BackgroundTask): string {
+  const kind = task.detail ?? task.kind;
+  const facts = taskFacts(task);
+  const after = facts.length === 0 ? "" : ` (${facts.join(", ")})`;
+  const output = task.outputFile === null ? "" : `\n    ${task.outputFile}`;
+  return `[${task.state}] ${task.title} — ${kind}${after}${output}`;
 }

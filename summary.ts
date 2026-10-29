@@ -7,17 +7,25 @@
 // instead of failing the whole summary.
 import type { PluginBbSdk } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import type { SessionSummary } from "./contract.ts";
-import { createTimelineScan, scanItem, type TimelineScan } from "./timeline.ts";
+import { BACKGROUND_EVENT_TYPES, finishBackground, scanBackgroundEvent } from "./background.ts";
+import { GIT_PLUGIN, gitContract, gitView, type SessionSummary, type ThreadRef } from "./contract.ts";
+import { repositoryWebUrl } from "./github.ts";
+import { createTimelineScan, isRecord, scanItem, type TimelineScan } from "./timeline.ts";
+import { addStep } from "./transcript.ts";
 
 
 const MAX_ENTRIES = 8;
 const MAX_TOOLS = 40;
+const MAX_BACKGROUND = 30;
 /** The server's cap on `threads.events.list`. */
 const EVENTS_PAGE = 100;
 /** Pages read per summary; a longer backlog continues on the next refresh. */
 const MAX_PAGES_PER_READ = 50;
 const MAX_CACHED_THREADS = 100;
+const MAX_ANCESTORS = 10;
+/** Levels of descendants read below a thread. */
+const MAX_DEPTH = 6;
+const MAX_DESCENDANTS = 200;
 
 /** Incremental timeline scans, so a refresh only reads new events. */
 export class TimelineCache {
@@ -63,14 +71,24 @@ export class TimelineCache {
     for (let page = 0; page < MAX_PAGES_PER_READ; page += 1) {
       const rows = await this.sdk.threads.events.list({
         threadId,
-        types: ["item/completed"],
+        types: ["item/completed", "thread/identity", ...BACKGROUND_EVENT_TYPES],
         order: "asc",
         limit: String(EVENTS_PAGE),
         ...(entry.afterSeq === null ? {} : { afterSeq: String(entry.afterSeq) }),
       });
       for (const row of rows) {
-        if (row.type === "item/completed") scanItem(entry.scan, row.data.item);
         entry.afterSeq = row.seq;
+        if (row.type === "thread/identity") entry.scan.sessionId = row.data.providerThreadId ?? entry.scan.sessionId;
+        if (!("item" in row.data)) continue;
+        const item = row.data.item;
+        // A subagent's step belongs to its conversation, not to this thread's counts.
+        const parentId = subagentParent(item);
+        if (row.type === "item/completed" && parentId !== null) {
+          addStep(entry.scan.steps, parentId, item);
+          continue;
+        }
+        if (row.type === "item/completed") scanItem(entry.scan, item);
+        scanBackgroundEvent(entry.scan.background, item, row.createdAt);
       }
       if (rows.length < EVENTS_PAGE) break;
     }
@@ -78,19 +96,32 @@ export class TimelineCache {
   }
 }
 
+/** The delegation a subagent's step belongs to. A background task names its delegation the same way but is the agent's own. */
+function subagentParent(item: unknown): string | null {
+  if (!isRecord(item) || item.type === "backgroundTask") return null;
+  return typeof item.parentToolCallId === "string" ? item.parentToolCallId : null;
+}
+
 export async function buildSessionSummary(
   sdk: PluginBbSdk,
   timeline: TimelineCache,
   threadId: string,
 ): Promise<SessionSummary> {
-  const thread = await sdk.threads.get({ threadId });
-  const [environment, context, scan] = await Promise.all([
-    readEnvironment(sdk, thread.environmentId, thread.projectId),
+  // These need only the id, so they start before the thread is read.
+  const reads = Promise.all([
     sdk.threads.context({ threadId }).then((result) => result.usage, () => null),
     timeline.read(threadId),
+    readActiveTasks(sdk, threadId),
   ]);
-  const pullRequest =
-    thread.environmentId === null ? null : await readBranchPullRequest(sdk, thread.environmentId);
+  reads.catch(() => {});
+  const { thread, environment: place, hostName } = await readThreadPlace(sdk, threadId);
+  const [[context, scan, activity], environment, pullRequest, lineage] = await Promise.all([
+    reads,
+    readEnvironment(sdk, place, hostName, thread.projectId),
+    thread.environmentId === null ? null : readBranchPullRequest(sdk, thread.environmentId),
+    readLineage(sdk, threadId, thread.parentThreadId, thread.originKind === "fork"),
+  ]);
+  const background = finishBackground(scan.background, activity, MAX_BACKGROUND);
 
   return {
     threadId,
@@ -102,45 +133,185 @@ export async function buildSessionSummary(
       pullRequest,
       workItems: [...scan.workItems.values()],
     },
+    background: background.tasks,
+    moreBackground: background.more,
+    lineage,
     itemsScanned: scan.itemsScanned,
   };
 }
 
+type ThreadRow = Awaited<ReturnType<PluginBbSdk["threads"]["list"]>>[number];
+
+function threadRef(row: ThreadRow): ThreadRef {
+  return {
+    id: row.id,
+    parentId: row.parentThreadId,
+    environmentId: row.environmentId,
+    title: row.title ?? row.titleFallback ?? "Untitled thread",
+    providerId: row.providerId,
+    status: row.status,
+    archived: row.archivedAt !== null,
+    fork: row.originKind === "fork",
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * A thread's events never change its parents or children, but a summary is
+ * rebuilt on each one, so lineage is read at most this often. The panel adds
+ * newly spawned threads live.
+ */
+const LINEAGE_TTL_MS = 30_000;
+const lineageCache = new Map<string, { at: number; lineage: SessionSummary["lineage"] }>();
+
+export type ListThreads = (args: Parameters<PluginBbSdk["threads"]["list"]>[0]) => Promise<ThreadRow[]>;
+
+/** The threads above and below this one, archived ones too; a part bb cannot read is left out. */
+async function readLineage(
+  sdk: PluginBbSdk,
+  threadId: string,
+  parentId: string | null,
+  fork: boolean,
+): Promise<SessionSummary["lineage"]> {
+  const cached = lineageCache.get(threadId);
+  if (cached !== undefined && Date.now() - cached.at < LINEAGE_TTL_MS) return cached.lineage;
+
+  const list: ListThreads = (args) => sdk.threads.list(args).catch(() => []);
+  const [ancestors, below] = await Promise.all([readAncestors(list, threadId, parentId), readDescendants(list, threadId)]);
+  const lineage = { fork, ancestors, ...below };
+  lineageCache.delete(threadId);
+  lineageCache.set(threadId, { at: Date.now(), lineage });
+  if (lineageCache.size > MAX_CACHED_THREADS) lineageCache.delete(lineageCache.keys().next().value!);
+  return lineage;
+}
+
+/** The chain of parents, root first; it stops at a thread bb cannot read or at a loop. */
+export async function readAncestors(list: ListThreads, threadId: string, parentId: string | null): Promise<ThreadRef[]> {
+  const chain: ThreadRef[] = [];
+  const seen = new Set([threadId]);
+  let next = parentId;
+  while (next !== null && !seen.has(next) && chain.length < MAX_ANCESTORS) {
+    seen.add(next);
+    const id = next;
+    const rows = await Promise.all([false, true].map((archived) => list({ threadIds: [id], includeHidden: true, archived })));
+    const row = rows.flat()[0];
+    if (row === undefined) break;
+    chain.unshift(threadRef(row));
+    next = row.parentThreadId;
+  }
+  return chain;
+}
+
+/** Every thread below this one, read a level at a time. */
+export async function readDescendants(
+  list: ListThreads,
+  threadId: string,
+): Promise<{ descendants: ThreadRef[]; truncated: boolean }> {
+  const descendants: ThreadRef[] = [];
+  const seen = new Set([threadId]);
+  let level = [threadId];
+  for (let depth = 0; level.length > 0; depth += 1) {
+    const rows = await Promise.all(
+      level.flatMap((id) => [list({ parentThreadId: id }), list({ parentThreadId: id, archived: true })]),
+    );
+    const found = rows.flat().filter((row) => !seen.has(row.id));
+    if (found.length > 0 && depth === MAX_DEPTH) return { descendants: sortByAge(descendants), truncated: true };
+    if (descendants.length + found.length > MAX_DESCENDANTS) {
+      descendants.push(...found.slice(0, MAX_DESCENDANTS - descendants.length).map(threadRef));
+      return { descendants: sortByAge(descendants), truncated: true };
+    }
+    for (const row of found) seen.add(row.id);
+    descendants.push(...found.map(threadRef));
+    level = found.map((row) => row.id);
+  }
+  return { descendants: sortByAge(descendants), truncated: false };
+}
+
+function sortByAge(threads: ThreadRef[]): ThreadRef[] {
+  return threads.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** The background tasks and workflows bb lists as still running, by item id; null when bb could not say. */
+async function readActiveTasks(sdk: PluginBbSdk, threadId: string): Promise<Set<string> | null> {
+  try {
+    const timeline = await sdk.threads.timeline({ threadId, summaryOnly: "true", segmentLimit: "1" });
+    return new Set([...timeline.activeBackgroundCommands, ...timeline.activeWorkflows].map((row) => row.itemId));
+  } catch {
+    return null;
+  }
+}
+
+/** The panel's queries open together and each needs the thread, so one read is shared this long. */
+const PLACE_SHARE_MS = 2_000;
+const placeReads = new Map<string, { at: number; read: ReturnType<typeof fetchThreadPlace> }>();
+
+/** A thread with its environment and machine name, in one call shared by reads close together. */
+export function readThreadPlace(sdk: PluginBbSdk, threadId: string): ReturnType<typeof fetchThreadPlace> {
+  const now = Date.now();
+  for (const [id, entry] of placeReads) if (now - entry.at >= PLACE_SHARE_MS) placeReads.delete(id);
+  const shared = placeReads.get(threadId);
+  if (shared !== undefined) return shared.read;
+  const read = fetchThreadPlace(sdk, threadId);
+  placeReads.set(threadId, { at: now, read });
+  read.catch(() => placeReads.delete(threadId));
+  return read;
+}
+
+async function fetchThreadPlace(sdk: PluginBbSdk, threadId: string) {
+  const thread = await sdk.threads.get({ threadId, include: "environment,host" });
+  return {
+    thread,
+    environment: ("environment" in thread ? thread.environment : null) ?? null,
+    hostName: ("environmentHostName" in thread ? thread.environmentHostName : null) ?? null,
+  };
+}
+type ThreadEnvironment = NonNullable<Awaited<ReturnType<typeof readThreadPlace>>["environment"]>;
+
 async function readEnvironment(
   sdk: PluginBbSdk,
-  environmentId: string | null,
+  environment: ThreadEnvironment | null,
+  hostName: string | null,
   projectId: string,
 ): Promise<SessionSummary["environment"]> {
-  if (environmentId === null) return null;
-  const environment = await sdk.environments.get({ environmentId });
-  const [host, project, status] = await Promise.all([
-    environment.hostId === null
-      ? null
-      : sdk.hosts.get({ hostId: environment.hostId }).catch(() => null),
+  if (environment === null) return null;
+  const [project, git] = await Promise.all([
     sdk.projects.get({ projectId }).catch(() => null),
-    environment.isGitRepo
-      ? sdk.environments.status({ environmentId }).catch(() => null)
-      : null,
+    environment.isGitRepo ? readGitStatus(sdk, environment.id) : null,
   ]);
-  const workspace = status?.outcome === "available" ? status.workspace : null;
-  const checkout = workspace?.checkout;
+  const remote = environment.isGitRepo ? (project?.gitRemoteUrl ?? null) : null;
   return {
-    machine: host?.name ?? null,
+    id: environment.id,
+    machine: hostName,
     project: project?.name ?? null,
+    repositoryUrl: remote === null ? null : repositoryWebUrl(remote),
     folder: environment.path,
     kind: environment.isWorktree ? "worktree" : environment.isGitRepo ? "checkout" : "folder",
-    branch: (checkout?.kind === "branch" ? checkout.branchName : null) ?? environment.branchName,
-    defaultBranch: workspace?.branch?.defaultBranch ?? environment.defaultBranch,
-    headSha: checkout !== undefined && "headSha" in checkout ? (checkout.headSha ?? null) : null,
-    workingTree:
-      workspace === null
-        ? null
-        : {
-            fileCount: workspace.workingTree.fileCount,
-            insertions: workspace.workingTree.insertions,
-            deletions: workspace.workingTree.deletions,
-          },
+    branch: git?.branch ?? environment.branchName,
+    headSha: git?.headSha ?? null,
+    workingTree: git?.workingTree ?? null,
+    branchChanges: git?.branchChanges ?? null,
   };
+}
+
+async function readGitStatus(sdk: PluginBbSdk, environmentId: string) {
+  const row = await readKeyedRow(sdk, GIT_PLUGIN, "status", environmentId, gitContract.status.output);
+  return row?.outcome === "available" ? gitView(row.workspace) : null;
+}
+
+/** One environment's row from another plugin's keyed RPC; null when the plugin is missing or fails. */
+async function readKeyedRow<Row>(
+  sdk: PluginBbSdk,
+  pluginId: string,
+  method: string,
+  key: string,
+  outputSchema: z.ZodType<Record<string, Row>>,
+): Promise<Row | null> {
+  try {
+    const rows = await sdk.plugins.callRpc({ pluginId, method, input: { keys: [key] }, outputSchema });
+    return rows[key] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 type ContextUsage = NonNullable<Awaited<ReturnType<PluginBbSdk["threads"]["context"]>>["usage"]>;
@@ -263,36 +434,25 @@ async function readBranchPullRequest(
   sdk: PluginBbSdk,
   environmentId: string,
 ): Promise<SessionSummary["changes"]["pullRequest"]> {
-  try {
-    const rows = await sdk.plugins.callRpc({
-      pluginId: GITHUB_PR_STATUS,
-      method: "pullRequests",
-      input: { keys: [environmentId] },
-      outputSchema: pullRequestRowsSchema,
-    });
-    const row = rows[environmentId];
-    if (row?.outcome !== "available") return null;
-    const pr = row.pullRequest;
-    return {
-      kind: "pullRequest",
-      number: pr.number,
-      title: pr.title,
-      url: pr.url,
-      state: pr.state,
-      headRef: pr.headRefName,
-      baseRef: pr.baseRefName,
-      // "review_requested" means reviewers are asked but none has answered.
-      review: pr.review.state === "review_requested" ? "review_required" : pr.review.state,
-      checks: {
-        state: pr.checks.state === "no_checks" ? "none" : pr.checks.state,
-        passed: pr.checks.passedCount,
-        failed: pr.checks.failedCount,
-        pending: pr.checks.pendingCount,
-        total: pr.checks.totalCount,
-      },
-    };
-  } catch {
-    // Plugin disabled, no `gh`, or the machine is offline: nothing to show.
-    return null;
-  }
+  const row = await readKeyedRow(sdk, GITHUB_PR_STATUS, "pullRequests", environmentId, pullRequestRowsSchema);
+  if (row?.outcome !== "available") return null;
+  const pr = row.pullRequest;
+  return {
+    kind: "pullRequest",
+    number: pr.number,
+    title: pr.title,
+    url: pr.url,
+    state: pr.state,
+    headRef: pr.headRefName,
+    baseRef: pr.baseRefName,
+    // "review_requested" means reviewers are asked but none has answered.
+    review: pr.review.state === "review_requested" ? "review_required" : pr.review.state,
+    checks: {
+      state: pr.checks.state === "no_checks" ? "none" : pr.checks.state,
+      passed: pr.checks.passedCount,
+      failed: pr.checks.failedCount,
+      pending: pr.checks.pendingCount,
+      total: pr.checks.totalCount,
+    },
+  };
 }

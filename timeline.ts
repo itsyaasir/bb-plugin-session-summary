@@ -6,6 +6,8 @@
 //
 // Pure: no SDK access, so the parsing is unit-testable on recorded items.
 import { z } from "zod";
+import { createBackgroundScan, type BackgroundScan } from "./background.ts";
+import type { SubagentSteps } from "./transcript.ts";
 
 export type WorkItemKind = "pullRequest" | "issue";
 export type WorkItemAction = "opened" | "merged" | "closed";
@@ -31,11 +33,17 @@ export interface TimelineScan {
   toolUses: Map<string, ToolUse>;
   /** Keyed by `${kind}:${action}:${label}`; later sightings never overwrite a URL with null. */
   workItems: Map<string, WorkItem>;
+  /** Background commands, subagents, and workflows; fed by background.ts. */
+  background: BackgroundScan;
+  /** The provider's id for the session, e.g. Claude Code's session id; null until seen. */
+  sessionId: string | null;
+  /** Each subagent's steps, keyed by its delegation item id; fed by transcript.ts. */
+  steps: Map<string, SubagentSteps>;
   itemsScanned: number;
 }
 
 export function createTimelineScan(): TimelineScan {
-  return { toolUses: new Map(), workItems: new Map(), itemsScanned: 0 };
+  return { toolUses: new Map(), workItems: new Map(), background: createBackgroundScan(), sessionId: null, steps: new Map(), itemsScanned: 0 };
 }
 
 // Only the fields we read, validated at the boundary; everything else passes.
@@ -174,7 +182,7 @@ function verbToAction(verb: string): WorkItemAction {
   return "opened";
 }
 
-function stringify(value: unknown): string {
+export function stringify(value: unknown): string {
   if (typeof value === "string") return value;
   if (value === undefined || value === null) return "";
   try {
@@ -184,6 +192,6 @@ function stringify(value: unknown): string {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
