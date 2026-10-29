@@ -13,6 +13,14 @@ It reports:
 
 - **Environment**: machine, project, folder, whether it is a worktree, the
   branch and HEAD, and the working tree's changed files.
+- **Servers**: what is listening from the thread's folder, with localhost
+  URLs; services and internal ports are marked.
+- **Background**: background commands, subagents, and workflows, running
+  first, then finished ones with their result, duration, tokens, and
+  output file. A subagent's conversation opens in a side-panel tab.
+- **Lineage**: the chain of parent threads up to the root (or the one it was
+  forked from), and every thread below it as a tree (children, their
+  children, and so on), with their status.
 - **Context**: tokens used of the window, cost when the provider reports it,
   and for Claude Code the breakdown by source (messages, system prompt, MCP
   tools, skills, memory files, custom agents) with each source's entries.

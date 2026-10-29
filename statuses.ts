@@ -3,7 +3,7 @@
 // cached status is missing or stale, so an open popover costs little.
 import type { PluginBbSdk } from "@get-bb/plugin-sdk";
 import { workItemKey, type ItemStatusRow, type ItemStatuses } from "./contract.ts";
-import type { TimelineCache } from "./summary.ts";
+import { readThreadPlace, type TimelineCache } from "./summary.ts";
 
 export type GithubItemsCall = (
   hostId: string,
@@ -47,13 +47,8 @@ export class WorkItemStatuses {
   }
 
   private async load(threadId: string): Promise<ItemStatuses> {
-    const thread = await this.sdk.threads.get({ threadId });
-    if (thread.environmentId === null) return {};
-    const [environment, scan] = await Promise.all([
-      this.sdk.environments.get({ environmentId: thread.environmentId }),
-      this.timeline.read(threadId),
-    ]);
-    if (environment.hostId === null) return {};
+    const [{ environment }, scan] = await Promise.all([readThreadPlace(this.sdk, threadId), this.timeline.read(threadId)]);
+    if (environment === null) return {};
     const hostId = environment.hostId;
     const cwd = environment.path ?? null;
 
